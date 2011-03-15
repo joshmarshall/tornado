@@ -20,6 +20,7 @@ import cgi
 import errno
 import logging
 import os
+import re
 import socket
 import time
 import urlparse
@@ -127,7 +128,7 @@ class HTTPServer(object):
     auto-detection.
     """
     def __init__(self, request_callback, no_keep_alive=False, io_loop=None,
-                 xheaders=False, ssl_options=None):
+                 xheaders=False, ssl_options=None, body_handlers=None):
         """Initializes the server with the given request callback.
 
         If you use pre-forking/start() instead of the listen() method to
@@ -140,8 +141,15 @@ class HTTPServer(object):
         self.io_loop = io_loop
         self.xheaders = xheaders
         self.ssl_options = ssl_options
+        self.body_handlers = []
         self._socket = None
         self._started = False
+
+        if not body_handlers:
+            body_handlers = []
+
+        for body_handler_re, body_handler in body_handlers:
+            self.body_handlers.append((re.compile(body_handler_re), body_handler))
 
     def listen(self, port, address=""):
         """Binds to the given port and starts the server in a single process.
@@ -263,7 +271,8 @@ class HTTPServer(object):
                 else:
                     stream = iostream.IOStream(connection, io_loop=self.io_loop)
                 HTTPConnection(stream, address, self.request_callback,
-                               self.no_keep_alive, self.xheaders)
+                               self.no_keep_alive, self.xheaders,
+                               self.body_handlers)
             except:
                 logging.error("Error in connection callback", exc_info=True)
 
@@ -278,7 +287,7 @@ class HTTPConnection(object):
     until the HTTP conection is closed.
     """
     def __init__(self, stream, address, request_callback, no_keep_alive=False,
-                 xheaders=False):
+                 xheaders=False, body_handlers=None):
         self.stream = stream
         self.address = address
         self.request_callback = request_callback
@@ -286,6 +295,7 @@ class HTTPConnection(object):
         self.xheaders = xheaders
         self._request = None
         self._request_finished = False
+        self.body_handlers = body_handlers or []
         # Save stack context here, outside of any request.  This keeps
         # contexts from one request from leaking into the next.
         self._header_callback = stack_context.wrap(self._on_headers)
@@ -343,12 +353,24 @@ class HTTPConnection(object):
             content_length = headers.get("Content-Length")
             if content_length:
                 content_length = int(content_length)
-                if content_length > self.stream.max_buffer_size:
-                    raise _BadRequestException("Content-Length too long")
                 if headers.get("Expect") == "100-continue":
                     self.stream.write("HTTP/1.1 100 (Continue)\r\n\r\n")
-                self.stream.read_bytes(content_length, self._on_request_body)
-                return
+                content_type = self._request.headers.get("Content-Type", "")
+                use_body_handler = HTTPParseBodyDefault
+
+                for body_handler_re, body_handler in self.body_handlers:
+                    if body_handler_re.search(content_type):
+                        use_body_handler = body_handler
+                        break
+                if use_body_handler:
+                    use_body_handler(
+                        self,
+                        self._request,
+                        self.stream,
+                        content_length,
+                        content_type
+                    )()
+                    return
 
             self.request_callback(self._request)
         except _BadRequestException, e:
@@ -357,16 +379,47 @@ class HTTPConnection(object):
             self.stream.close()
             return
 
+class HTTPParseBody(object):
+    """Handles the logic for parsing a PUT / POST body with a
+    particular mimetype. Should be subclassed like the following:
+    """
+
+    def __init__(self, context, request, stream, content_length,
+                 content_type):
+        self.context = context
+        self.stream = stream
+        self.request = request
+        self.content_length = content_length
+        self.content_type = content_type
+        self._done = False
+
+    def done(self):
+        """ Actually calls the request handler (but only once). """
+        if self._done:
+            raise Exception("Callback already called!")
+        self._done = True
+        self.context.request_callback(self.request)
+
+class HTTPParseBodyDefault(HTTPParseBody):
+    """The default body parser -- reads entire contents of post
+    into memory and parses it into arguments / files.
+    """
+
+    def __call__(self):
+        if self.content_length > self.stream.max_buffer_size:
+            raise _BadRequestException("Content-Length too long")
+        self.stream.read_bytes(self.content_length, self._on_request_body)
+
     def _on_request_body(self, data):
-        self._request.body = data
-        content_type = self._request.headers.get("Content-Type", "")
-        if self._request.method in ("POST", "PUT"):
+        self.request.body = data
+        content_type = self.request.headers.get("Content-Type", "")
+        if self.request.method in ("POST", "PUT"):
             if content_type.startswith("application/x-www-form-urlencoded"):
-                arguments = cgi.parse_qs(self._request.body)
+                arguments = cgi.parse_qs(self.request.body)
                 for name, values in arguments.iteritems():
                     values = [v for v in values if v]
                     if values:
-                        self._request.arguments.setdefault(name, []).extend(
+                        self.request.arguments.setdefault(name, []).extend(
                             values)
             elif content_type.startswith("multipart/form-data"):
                 fields = content_type.split(";")
@@ -377,7 +430,7 @@ class HTTPConnection(object):
                         break
                 else:
                     logging.warning("Invalid multipart/form-data")
-        self.request_callback(self._request)
+        self.done()
 
     def _parse_mime_body(self, boundary, data):
         # The standard allows for the boundary to be quoted in the header,
@@ -415,12 +468,12 @@ class HTTPConnection(object):
             name = name_values["name"]
             if name_values.get("filename"):
                 ctype = headers.get("Content-Type", "application/unknown")
-                self._request.files.setdefault(name, []).append(dict(
+                self.request.files.setdefault(name, []).append(dict(
                     filename=name_values["filename"], body=value,
                     content_type=ctype))
             else:
-                self._request.arguments.setdefault(name, []).append(value)
-
+                self.request.arguments.setdefault(name, []).append(value)
+        self.done()
 
 class HTTPRequest(object):
     """A single HTTP request.
